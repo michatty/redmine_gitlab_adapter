@@ -1,6 +1,6 @@
 require 'redmine/scm/adapters/abstract_adapter'
+require 'gitlab'
 require 'uri'
-require 'no_proxy_fix'
 
 module Redmine
   module Scm
@@ -52,15 +52,64 @@ module Redmine
           @project = url.sub(root_url, '').sub(/^\//, '').sub(/\.git$/, '')
 
           ## Set Gitlab endpoint and token
-          Gitlab.endpoint = root_url + '/api/v4'
-          Gitlab.private_token = password
+          endpoint = root_url.to_s.chomp('/') + '/api/v4'
 
-          ## Set proxy
-          proxy = URI.parse(url).find_proxy
-          unless proxy.nil?
-            Gitlab.http_proxy(proxy.host, proxy.port, proxy.user, proxy.password)
+          httparty_opts = {}
+          proxy = proxy_from_env(url)
+          if proxy
+            httparty_opts[:http_proxyaddr] = proxy.host
+            httparty_opts[:http_proxyport] = proxy.port
+            httparty_opts[:http_proxyuser] = proxy.user
+            httparty_opts[:http_proxypass] = proxy.password
+          end
+
+          @client = ::Gitlab.client(
+            endpoint: endpoint,
+            private_token: password,
+            httparty: httparty_opts
+          )
+        end
+
+        def proxy_from_env(url)
+          uri = URI.parse(url.to_s)
+          return nil if uri.host.to_s.empty?
+
+          no_proxy = ENV['no_proxy'] || ENV['NO_PROXY']
+          if no_proxy_match?(uri.host, no_proxy)
+            return nil
+          end
+
+          proxy_env = if uri.scheme.to_s.downcase == 'https'
+                        ENV['https_proxy'] || ENV['HTTPS_PROXY'] || ENV['http_proxy'] || ENV['HTTP_PROXY']
+                      else
+                        ENV['http_proxy'] || ENV['HTTP_PROXY']
+                      end
+          return nil if proxy_env.to_s.strip.empty?
+
+          proxy_uri = URI.parse(proxy_env)
+          return nil if proxy_uri.host.to_s.empty?
+
+          proxy_uri
+        rescue StandardError
+          nil
+        end
+        private :proxy_from_env
+
+        def no_proxy_match?(host, no_proxy_value)
+          return false if host.to_s.empty?
+          return false if no_proxy_value.to_s.strip.empty?
+
+          host = host.to_s.downcase
+          no_proxy_value.to_s.split(',').map(&:strip).reject(&:empty?).any? do |pattern|
+            pattern = pattern.downcase
+            return true if pattern == '*'
+            next true if host == pattern
+            next true if pattern.start_with?('.') && host.end_with?(pattern)
+
+            false
           end
         end
+        private :no_proxy_match?
 
         def info
           Info.new(:root_url => root_url, :lastrev => lastrev('',nil))
@@ -72,7 +121,7 @@ module Redmine
           return @branches if @branches
           @branches = []
           1.step do |i|
-            gitlab_branches = Gitlab.branches(@project, {page: i, per_page: PER_PAGE})
+            gitlab_branches = @client.branches(@project, {page: i, per_page: PER_PAGE})
             break if gitlab_branches.length == 0
             gitlab_branches.each do |gitlab_branche|
               bran = GitlabBranch.new(gitlab_branche.name)
@@ -91,7 +140,7 @@ module Redmine
           return @tags if @tags
           @tags = []
           1.step do |i|
-            gitlab_tags = Gitlab.tags(@project, {page: i, per_page: PER_PAGE})
+            gitlab_tags = @client.tags(@project, {page: i, per_page: PER_PAGE})
             break if gitlab_tags.length == 0
             gitlab_tags.each do |gitlab_tag|
               @tags << gitlab_tag.name
@@ -107,7 +156,7 @@ module Redmine
 
           (
             branches.detect(&:is_default) ||
-            branches.detect {|b| GIT_DEFAULT_BRANCH_NAMES.include?(b.to_s)} ||
+            branches.detect {|b| GITLAB_DEFAULT_BRANCH_NAMES.include?(b.to_s)} ||
             branches.first
           ).to_s
         end
@@ -133,14 +182,14 @@ module Redmine
 
           entries = Entries.new
           1.step do |i|
-            files = Gitlab.tree(@project, {path: path, ref: identifier, page: i, per_page: PER_PAGE})
+            files = @client.tree(@project, {path: path, ref: identifier, page: i, per_page: PER_PAGE})
             break if files.length == 0
 
             files.each do |file|
               full_path = path.empty? ? file.name : "#{path}/#{file.name}"
               size = nil
               unless (file.type == "tree")
-                gitlab_get_file = Gitlab.get_file(@project, full_path, identifier)
+                gitlab_get_file = @client.get_file(@project, full_path, identifier)
                 size = gitlab_get_file.size
               end
               entries << Entry.new({
@@ -159,7 +208,7 @@ module Redmine
 
         def lastrev(path, rev)
           return nil if path.nil?
-          gitlab_commits = Gitlab.commits(@project, {path: path, ref_name: rev, per_page: 1})
+          gitlab_commits = @client.commits(@project, {path: path, ref_name: rev, per_page: 1})
           gitlab_commits.each do |gitlab_commit|
             return Revision.new({
               :identifier => gitlab_commit.id,
@@ -189,7 +238,7 @@ module Redmine
             start_page = 1
             0.step do |i|
               start_page = i * MAX_PAGES + 1
-              gitlab_commits = Gitlab.commits(@project, {all: true, since: since, page: start_page, per_page: per_page})
+              gitlab_commits = @client.commits(@project, {all: true, since: since, page: start_page, per_page: per_page})
               if gitlab_commits.length < per_page
                 start_page = start_page - MAX_PAGES if i > 0
                 break
@@ -198,11 +247,11 @@ module Redmine
 
             ## Step 2: Get the commits from start_page
             start_page.step do |i|
-              gitlab_commits = Gitlab.commits(@project, {all: true, since: since, page: i, per_page: per_page})
+              gitlab_commits = @client.commits(@project, {all: true, since: since, page: i, per_page: per_page})
               break if gitlab_commits.length == 0
               gitlab_commits.each do |gitlab_commit|
                 files=[]
-                gitlab_commit_diff = Gitlab.commit_diff(@project, gitlab_commit.id)
+                gitlab_commit_diff = @client.commit_diff(@project, gitlab_commit.id)
                 gitlab_commit_diff.each do |commit_diff|
                   if commit_diff.new_file
                     files << {:action => 'A', :path => commit_diff.new_path}
@@ -228,7 +277,7 @@ module Redmine
               end
             end
           else
-            gitlab_commits = Gitlab.commits(@project, {path: path, ref_name: identifier_to, per_page: per_page})
+            gitlab_commits = @client.commits(@project, {path: path, ref_name: identifier_to, per_page: per_page})
             gitlab_commits.each do |gitlab_commit|
               revision = Revision.new({
                 :identifier => gitlab_commit.id,
@@ -257,9 +306,9 @@ module Redmine
 
           gitlab_diffs = []
           if identifier_to.nil?
-            gitlab_diffs = Gitlab.commit_diff(@project, identifier_from)
+            gitlab_diffs = @client.commit_diff(@project, identifier_from)
           else
-            gitlab_diffs = Gitlab.compare(@project, identifier_to, identifier_from).diffs
+            gitlab_diffs = @client.compare(@project, identifier_to, identifier_from).diffs
           end
 
           gitlab_diffs.each do |gitlab_diff|
@@ -316,7 +365,7 @@ module Redmine
         def annotate(path, identifier=nil)
           identifier = 'HEAD' if identifier.blank?
           blame = Annotate.new
-          gitlab_get_file_blame = Gitlab.get_file_blame(@project, path, identifier)
+          gitlab_get_file_blame = @client.get_file_blame(@project, path, identifier)
           gitlab_get_file_blame.each do |file_blame|
             file_blame.lines.each do |line|
               blame.add_line(line, Revision.new(
@@ -334,7 +383,7 @@ module Redmine
 
         def cat(path, identifier=nil)
           identifier = 'HEAD' if identifier.nil?
-          Gitlab.file_contents(@project, path, identifier)
+          @client.file_contents(@project, path, identifier)
         rescue Gitlab::Error::Error
           nil
         end
