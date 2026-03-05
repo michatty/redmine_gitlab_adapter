@@ -26,10 +26,10 @@ end
 
 Redmine::Plugin.register :redmine_gitlab_adapter do
   name 'Redmine Gitlab Adapter plugin'
-  author 'Future Corporation'
-  description 'This is a Gitlab Adapter plugin for Redmine'
-  version '0.3.0'
-  url 'https://www.future.co.jp'
-  author_url 'https://www.future.co.jp'
+  author 'Future Corporation (original) / michatty (fork maintainer)'
+  description 'GitLab Adapter plugin for Redmine (fork for Redmine 6.1.1)'
+  version '0.3.1'
+  url 'https://github.com/michatty/redmine_gitlab_adapter'
+  author_url 'https://github.com/michatty'
   Redmine::Scm::Base.add "Gitlab"
 end
