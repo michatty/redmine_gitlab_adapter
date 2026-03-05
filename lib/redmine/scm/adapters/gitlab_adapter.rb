@@ -55,23 +55,66 @@ module Redmine
           @project = url.sub(root_url, '').sub(/^\//, '').sub(/\.git$/, '')
 
           ## Set Gitlab endpoint and token
-          endpoint = root_url.to_s.chomp('/') + '/api/v4'
+          @endpoint = root_url.to_s.chomp('/') + '/api/v4'
+          @private_token = password
 
-          httparty_opts = {}
+          @httparty_opts = {}
           proxy = proxy_from_env(url)
           if proxy
-            httparty_opts[:http_proxyaddr] = proxy.host
-            httparty_opts[:http_proxyport] = proxy.port
-            httparty_opts[:http_proxyuser] = proxy.user
-            httparty_opts[:http_proxypass] = proxy.password
+          @httparty_opts[:http_proxyaddr] = proxy.host
+          @httparty_opts[:http_proxyport] = proxy.port
+          @httparty_opts[:http_proxyuser] = proxy.user
+          @httparty_opts[:http_proxypass] = proxy.password
           end
 
-          @client = ::Gitlab.client(
-            endpoint: endpoint,
-            private_token: password,
-            httparty: httparty_opts
+          @client = build_client
+        end
+
+        def build_client
+          ::Gitlab.client(
+          endpoint: @endpoint,
+          private_token: @private_token,
+          httparty: @httparty_opts
           )
         end
+        private :build_client
+
+        def entries_parallel_fetch?
+          v = ENV.fetch('REDMINE_GITLAB_ADAPTER_PARALLEL_TREE_PAGES', 'true')
+          v.to_s.strip.downcase != '0' && v.to_s.strip.downcase != 'false'
+        end
+        private :entries_parallel_fetch?
+
+        def entries_parallel_threads
+          v = ENV.fetch('REDMINE_GITLAB_ADAPTER_PARALLEL_TREE_THREADS', '4')
+          n = v.to_i
+          return 1 if n <= 0
+          [n, 8].min
+        end
+        private :entries_parallel_threads
+
+        def paginated_total_pages(response)
+          if response.respond_to?(:total_pages)
+          pages = response.total_pages.to_i
+          return pages if pages > 0
+          end
+
+          # Fallback to headers (GitLab uses X-Total-Pages)
+          headers = nil
+          headers = response.headers if response.respond_to?(:headers)
+          if headers.nil? && response.respond_to?(:response_headers)
+          headers = response.response_headers
+          end
+
+          if headers
+          value = headers['x-total-pages'] || headers['X-Total-Pages']
+          pages = value.to_i
+          return pages if pages > 0
+          end
+
+          nil
+        end
+        private :paginated_total_pages
 
         def fetch_file_size?
           v = ENV['REDMINE_GITLAB_ADAPTER_FETCH_FILE_SIZE']
@@ -200,29 +243,75 @@ module Redmine
 
           entries = Entries.new
           seen_names = {}
-          1.step do |i|
-            files = @client.tree(@project, {path: path, ref: identifier, page: i, per_page: PER_PAGE})
-            break if files.length == 0
 
-            files.each do |file|
-              full_path = path.empty? ? file.name : "#{path}/#{file.name}"
-            next if seen_names[file.name]
-            seen_names[file.name] = true
+          files_page_1 = @client.tree(@project, {path: path, ref: identifier, page: 1, per_page: PER_PAGE})
+          total_pages = paginated_total_pages(files_page_1)
+          pages = total_pages ? (1..total_pages).to_a : [1]
 
-            size = nil
-            if fetch_size && file.type != 'tree'
+          all_files = []
+          if pages.length > 1 && entries_parallel_fetch?
+          # Parallelize pagination to reduce wall time on high-latency links.
+          queue = Queue.new
+          pages.drop(1).each { |p| queue << p }
+          mutex = Mutex.new
+          exception_mutex = Mutex.new
+          exceptions = []
+
+          threads = [entries_parallel_threads, queue.size].min.times.map do
+            Thread.new do
+            begin
+              thread_client = build_client
+              loop do
+              page = nil
+              begin
+                page = queue.pop(true)
+              rescue ThreadError
+                break
+              end
+              resp = thread_client.tree(@project, {path: path, ref: identifier, page: page, per_page: PER_PAGE})
+              mutex.synchronize { all_files.concat(resp.to_a) }
+              end
+            rescue StandardError => e
+              exception_mutex.synchronize { exceptions << e }
+            end
+            end
+          end
+
+          # Include first page results
+          all_files.concat(files_page_1.to_a)
+          threads.each(&:join)
+          raise exceptions.first if exceptions.any?
+          else
+          # Sequential pagination (fallback / unknown total_pages)
+          page = 1
+          loop do
+            resp = (page == 1) ? files_page_1 : @client.tree(@project, {path: path, ref: identifier, page: page, per_page: PER_PAGE})
+            break if resp.length == 0
+            all_files.concat(resp.to_a)
+            break if total_pages && page >= total_pages
+            page += 1
+          end
+          end
+
+          all_files.each do |file|
+          full_path = path.empty? ? file.name : "#{path}/#{file.name}"
+          next if seen_names[file.name]
+          seen_names[file.name] = true
+
+          size = nil
+          if fetch_size && file.type != 'tree'
             # NOTE: This is an extra API call per file. Disabled by default for performance.
             gitlab_get_file = @client.get_file(@project, full_path, identifier)
             size = gitlab_get_file.size
-            end
-              entries << Entry.new({
-                :name => file.name.dup,
-                :path => full_path.dup,
-                :kind => (file.type == "tree") ? 'dir' : 'file',
-                :size => (file.type == "tree") ? nil : size,
+          end
+
+          entries << Entry.new({
+            :name => file.name.dup,
+            :path => full_path.dup,
+            :kind => (file.type == "tree") ? 'dir' : 'file',
+            :size => (file.type == "tree") ? nil : size,
             :lastrev => report_last_commit ? lastrev(full_path, identifier) : Revision.new
-            })
-            end
+          })
           end
           entries = entries.sort_by_name
           @entries_cache[cache_key] = entries

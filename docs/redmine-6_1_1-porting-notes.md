@@ -299,3 +299,25 @@ export REDMINE_GITLAB_ADAPTER_FETCH_FILE_SIZE=true
 ```
 
 systemd 運用（EnvironmentFile 方式）の場合は `/etc/default/redmine` に追加します。
+
+### 大量ファイルのディレクトリ表示（tree API の並列ページ取得）
+
+ディレクトリ直下に多数のファイルがある場合、GitLab API の `tree` はページングされます（`per_page` 上限の影響）。
+プロキシ配下などで 1 リクエストあたりのレイテンシが大きいと、ページを直列に取得するだけで表示が遅くなります。
+
+本 fork では、`tree` の複数ページ取得を **並列化**して待ち時間を短縮します（デフォルト有効）。
+
+- 並列化の有効/無効:
+
+```bash
+export REDMINE_GITLAB_ADAPTER_PARALLEL_TREE_PAGES=true
+```
+
+- 並列スレッド数（デフォルト: 4、上限: 8）:
+
+```bash
+export REDMINE_GITLAB_ADAPTER_PARALLEL_TREE_THREADS=4
+```
+
+注意:
+- GitLab 側に同時リクエストが増えるため、環境によっては負荷やレート制限の影響を受ける可能性があります。問題が出る場合は `...PARALLEL_TREE_PAGES=false` またはスレッド数を下げてください。
