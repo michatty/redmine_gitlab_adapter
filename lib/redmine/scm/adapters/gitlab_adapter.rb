@@ -13,7 +13,7 @@ module Redmine
         # "main" instead of "master"
         GITLAB_DEFAULT_BRANCH_NAMES = %w[main master].freeze
 
-        PER_PAGE = 50
+        PER_PAGE = 100
         MAX_PAGES = 10
 
         class GitlabBranch < Branch
@@ -48,6 +48,9 @@ module Redmine
         def initialize(url, root_url=nil, login=nil, password=nil, path_encoding=nil)
           super
 
+          @entries_cache = {}
+          @lastrev_cache = {}
+
           ## Get gitlab project
           @project = url.sub(root_url, '').sub(/^\//, '').sub(/\.git$/, '')
 
@@ -69,6 +72,12 @@ module Redmine
             httparty: httparty_opts
           )
         end
+
+        def fetch_file_size?
+          v = ENV['REDMINE_GITLAB_ADAPTER_FETCH_FILE_SIZE']
+          v.to_s.strip.downcase == '1' || v.to_s.strip.downcase == 'true'
+        end
+        private :fetch_file_size?
 
         def proxy_from_env(url)
           uri = URI.parse(url.to_s)
@@ -180,37 +189,55 @@ module Redmine
           path ||= ''
           identifier = 'HEAD' if identifier.nil?
 
+          report_last_commit = options[:report_last_commit] ? true : false
+          fetch_size = fetch_file_size?
+          cache_key = [path.to_s, identifier.to_s, report_last_commit ? 1 : 0, fetch_size ? 1 : 0]
+          if @entries_cache.key?(cache_key)
+          cached = @entries_cache[cache_key]
+          return cached.deep_dup if cached.respond_to?(:deep_dup)
+          return cached
+          end
+
           entries = Entries.new
+          seen_names = {}
           1.step do |i|
             files = @client.tree(@project, {path: path, ref: identifier, page: i, per_page: PER_PAGE})
             break if files.length == 0
 
             files.each do |file|
               full_path = path.empty? ? file.name : "#{path}/#{file.name}"
-              size = nil
-              unless (file.type == "tree")
-                gitlab_get_file = @client.get_file(@project, full_path, identifier)
-                size = gitlab_get_file.size
-              end
+            next if seen_names[file.name]
+            seen_names[file.name] = true
+
+            size = nil
+            if fetch_size && file.type != 'tree'
+            # NOTE: This is an extra API call per file. Disabled by default for performance.
+            gitlab_get_file = @client.get_file(@project, full_path, identifier)
+            size = gitlab_get_file.size
+            end
               entries << Entry.new({
                 :name => file.name.dup,
                 :path => full_path.dup,
                 :kind => (file.type == "tree") ? 'dir' : 'file',
                 :size => (file.type == "tree") ? nil : size,
-                :lastrev => options[:report_last_commit] ? lastrev(full_path, identifier) : Revision.new
-              }) unless entries.detect{|entry| entry.name == file.name}
+            :lastrev => report_last_commit ? lastrev(full_path, identifier) : Revision.new
+            })
             end
           end
-          entries.sort_by_name
+          entries = entries.sort_by_name
+          @entries_cache[cache_key] = entries
+          entries
         rescue Gitlab::Error::Error
           nil
         end
 
         def lastrev(path, rev)
           return nil if path.nil?
+          key = [path.to_s, rev.to_s]
+          return @lastrev_cache[key] if @lastrev_cache.key?(key)
           gitlab_commits = @client.commits(@project, {path: path, ref_name: rev, per_page: 1})
           gitlab_commits.each do |gitlab_commit|
-            return Revision.new({
+          rev_obj = Revision.new({
               :identifier => gitlab_commit.id,
               :scmid      => gitlab_commit.id,
               :author     => gitlab_commit.author_name,
@@ -218,9 +245,13 @@ module Redmine
               :message    => nil,
               :paths      => nil
             })
+          @lastrev_cache[key] = rev_obj
+          return rev_obj
           end
+          @lastrev_cache[key] = nil
           return nil
         rescue Gitlab::Error::Error
+          @lastrev_cache[key] = nil
           nil
         end
 
